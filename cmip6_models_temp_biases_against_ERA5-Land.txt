@@ -1,0 +1,140 @@
+// Models 
+              // 'ACCESS-CM2', 
+              // 'ACCESS-ESM1-5', 
+              // 'BCC-CSM2-MR', 
+              // 'CESM2', 
+              // 'CESM2-WACCM', 
+              // 'CMCC-CM2-SR5', 
+              // 'CMCC-ESM2', 
+              // 'CNRM-CM6-1', 
+              // 'CNRM-ESM2-1', 
+              // 'CanESM5', 
+              // 'EC-Earth3', 
+              // 'EC-Earth3-Veg-LR', 
+              // 'FGOALS-g3',
+              // 'GFDL-CM4', 
+              // 'GFDL-ESM4',       
+              // 'GISS-E2-1-G', 
+              // 'HadGEM3-GC31-LL',
+              // // 'HadGEM3-GC31-MM', // This model exluded from calculations, NO DATA
+              // // 'IITM-ESM',        // This model exluded from calculations, NO DATA FOR 2100
+              // 'INM-CM4-8', 
+              // 'INM-CM5-0', 
+              // 'IPSL-CM6A-LR',
+              // 'KACE-1-0-G', 
+              // 'KIOST-ESM', 
+              // 'MIROC-ES2L', 
+              // 'MIROC6', 
+              // 'MPI-ESM1-2-HR', 
+              // 'MPI-ESM1-2-LR', 
+              // 'MRI-ESM2-0', 
+              // 'NESM3', 
+              // 'NorESM2-LM',        
+              // 'NorESM2-MM', 
+              // 'TaiESM1', 
+              // 'UKESM1-0-LL'
+
+var path = "FAO/GAUL_SIMPLIFIED_500m/2015/level0"; 
+var country_code = 132; // Kazakhstan
+var country = ee.FeatureCollection(path).filter(ee.Filter.eq('ADM0_CODE', country_code));
+
+// Single model to calculate bias
+var model = 'CESM2'; 
+
+var calculateModelBias = function(model) {
+  var cmip6 = ee.ImageCollection('NASA/GDDP-CMIP6')
+                  .filter(ee.Filter.eq('scenario', 'historical'))
+                  .filter(ee.Filter.eq('model', model))
+                  // .filterMetadata('grid_label', 'equals', 'gr1') // apply this filter only for GFDL-CM4 model
+                  ;
+
+  var yearlyMeansCollection = ee.ImageCollection([]);
+
+  for (var year = 1951; year <= 2014; year++) {
+    var dateRange = ee.DateRange(ee.Date(year + '-01-01'), ee.Date(year + '-12-31'));
+    var filteredCollection = cmip6.filterDate(dateRange);
+
+    var temperatureBand = 'tas';
+
+    var monthlyMeansCollection = ee.ImageCollection.fromImages(
+      ee.List.sequence(1, 12).map(function (month) {
+        var monthlyCollection = filteredCollection
+                                  .filter(ee.Filter.calendarRange(year, year, 'year'))
+                                  .filter(ee.Filter.calendarRange(month, month, 'month'));
+
+        var meanTemperature = monthlyCollection.select(temperatureBand)
+                                               .mean().subtract(273.15) // Convert Kelvin to Celsius
+                                               .rename(['meanTemperature'])
+                                               .reproject({
+                                                  crs: cmip6.first().projection().crs(),
+                                                  scale: cmip6.first().projection().nominalScale()
+                                                });
+
+        return meanTemperature.set('year', year).set('month', month);
+      })
+    );
+
+    yearlyMeansCollection = yearlyMeansCollection.merge(monthlyMeansCollection);
+  }
+// print(yearlyMeansCollection)
+  var cmip6Mean = yearlyMeansCollection.select('meanTemperature').mean().reproject({
+    crs: cmip6.first().projection().crs(),
+    scale: cmip6.first().projection().nominalScale()
+  });
+
+  var era5 = ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY")
+                .filterDate('1951-01-01', '2014-12-31')
+                .filterBounds(country)
+                .select('temperature_2m');
+  var era5Mean = era5.mean().subtract(273.15);
+
+  var era5Aligned = era5Mean.reproject({
+    crs: cmip6Mean.projection().crs(),
+    scale: cmip6Mean.projection().nominalScale()
+  });
+
+  var bias = cmip6Mean.subtract(era5Aligned).rename('bias');
+  return bias.set('model', model);
+};
+
+var biasImage = calculateModelBias(model);
+Map.addLayer(biasImage.clip(country), 
+  {min: -1, max: 1, palette: ['blue', 'white', 'red']}, 
+  'Bias (' + model + ')');
+
+var absBias = biasImage.abs();
+Map.addLayer(absBias.clip(country), 
+  {min: 0, max: 1, palette: ['white', 'red']}, 
+  'Absolute Bias (' + model + ')');
+
+var significantChange = absBias.gt(1.5); 
+Map.addLayer(significantChange.clip(country), 
+  {min: 0, max: 1, palette: ['white', 'red']}, 
+  'Significant Changes, threshold is absBias > 0.8 (' + model + ')');
+
+// Calculate statistics
+var meanBias = biasImage.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: country.geometry(),
+  scale: 27829.87269831839,
+  maxPixels: 1e13
+}).get('bias');
+
+var absMeanBias = biasImage.abs().reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: country.geometry(),
+  scale: 27829.87269831839,
+  maxPixels: 1e13
+}).get('bias');
+
+var stdDevBias = biasImage.reduceRegion({
+  reducer: ee.Reducer.stdDev(),
+  geometry: country.geometry(),
+  scale: 27829.87269831839,
+  maxPixels: 1e13
+}).get('bias');
+
+// Print statistics
+print('Mean Bias for ' + model, meanBias);
+print('Mean Absolute Bias for ' + model, absMeanBias);
+print('Standard Deviation of Bias for ' + model, stdDevBias);
